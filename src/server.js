@@ -4,15 +4,17 @@ const cors = require('cors');
 
 const authRoutes = require('./routes/auth');
 const socialRoutes = require('./routes/social');
+const postsRoutes = require('./routes/posts');
 
 const app = express();
 app.use(cors());
-app.use(express.json());
+app.use(express.json({ limit: '10mb' }));
 
 app.get('/health', (req, res) => res.json({ ok: true }));
 
 app.use('/auth', authRoutes);
 app.use('/', socialRoutes);
+app.use('/', postsRoutes);
 
 app.use((err, req, res, next) => {
   console.error(err);
