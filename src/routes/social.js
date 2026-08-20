@@ -1,4 +1,3 @@
-
 const express = require('express');
 const { pool } = require('../db');
 const { requireAuth } = require('../middleware/auth');
@@ -168,6 +167,8 @@ router.delete('/live-rooms/:code', requireAuth, safe(async (req, res) => {
 }));
 
 router.get('/live-rooms', safe(async (req, res) => {
+  // Rooms "expire" from the list after 2 hours with no refresh, in case a host's
+  // browser closed without cleanly leaving
   const r = await pool.query(`SELECT code, host_handle, host_display_name, started_at FROM live_rooms WHERE started_at > now() - interval '2 hours' ORDER BY started_at DESC`);
   res.json(r.rows);
 }));
@@ -186,4 +187,41 @@ router.post('/marketplace/listings', requireAuth, safe(async (req, res) => {
 
 router.get('/marketplace/listings', safe(async (req, res) => {
   const r = await pool.query(
-    `SELECT l.id, l.title, l.description, l.product_link, l.image_data, l.price, l.cu
+    `SELECT l.id, l.title, l.description, l.product_link, l.image_data, l.price, l.currency, l.created_at,
+            u.handle, u.display_name, u.verified
+     FROM marketplace_listings l JOIN users u ON u.id = l.seller_id
+     ORDER BY l.created_at DESC LIMIT 60`
+  );
+  res.json(r.rows);
+}));
+
+router.delete('/marketplace/listings/:id', requireAuth, safe(async (req, res) => {
+  await pool.query(`DELETE FROM marketplace_listings WHERE id = $1 AND seller_id = $2`, [req.params.id, req.user.sub]);
+  res.status(204).end();
+}));
+
+router.post('/marketplace/listings/:id/order', requireAuth, safe(async (req, res) => {
+  const { buyerName, buyerPhone, buyerAddress } = req.body;
+  if (!buyerName || !buyerPhone || !buyerAddress) return res.status(400).json({ error: 'Name, phone, and address are all required' });
+  const r = await pool.query(
+    `INSERT INTO marketplace_orders (listing_id, buyer_id, buyer_name, buyer_phone, buyer_address)
+     VALUES ($1, $2, $3, $4, $5) RETURNING id, created_at`,
+    [req.params.id, req.user.sub, buyerName.slice(0, 100), buyerPhone.slice(0, 30), buyerAddress.slice(0, 400)]
+  );
+  res.status(201).json(r.rows[0]);
+}));
+
+// Seller views orders placed against their own listings — includes the
+// listing's payout info so they know exactly where the buyer should pay.
+router.get('/marketplace/my-orders', requireAuth, safe(async (req, res) => {
+  const r = await pool.query(
+    `SELECT o.id, o.buyer_name, o.buyer_phone, o.buyer_address, o.created_at,
+            l.title, l.price, l.currency, l.payout_info
+     FROM marketplace_orders o JOIN marketplace_listings l ON l.id = o.listing_id
+     WHERE l.seller_id = $1 ORDER BY o.created_at DESC`,
+    [req.user.sub]
+  );
+  res.json(r.rows);
+}));
+
+module.exports = router;
