@@ -19,9 +19,27 @@ router.get('/users/search', safe(async (req, res) => {
 }));
 
 router.get('/users/:handle/profile', safe(async (req, res) => {
-  const r = await pool.query(`SELECT id, handle, display_name, bio, verified, created_at, (SELECT COUNT(*) FROM follows WHERE followee_id = users.id) AS followers, (SELECT COUNT(*) FROM follows WHERE follower_id = users.id) AS following FROM users WHERE handle = $1`, [req.params.handle]);
+  const r = await pool.query(`SELECT id, handle, display_name, bio, verified, created_at,
+      (SELECT COUNT(*) FROM follows WHERE followee_id = users.id) AS followers,
+      (SELECT COUNT(*) FROM follows WHERE follower_id = users.id) AS following,
+      (SELECT COUNT(*) FROM gifts_sent WHERE to_user_id = users.id) AS gifts_received
+    FROM users WHERE handle = $1`, [req.params.handle]);
   if (!r.rows.length) return res.status(404).json({ error: 'User not found' });
   res.json(r.rows[0]);
+}));
+
+router.get('/users/me/live-eligibility', requireAuth, safe(async (req, res) => {
+  const u = await pool.query(`SELECT verified FROM users WHERE id = $1`, [req.user.sub]);
+  const followers = await pool.query(`SELECT COUNT(*) FROM follows WHERE followee_id = $1`, [req.user.sub]);
+  const likes = await pool.query(
+    `SELECT COUNT(*) FROM likes l JOIN feed_posts p ON p.id::text = l.video_id::text WHERE p.user_id = $1`,
+    [req.user.sub]
+  );
+  const followerCount = parseInt(followers.rows[0].count, 10);
+  const likeCount = parseInt(likes.rows[0].count, 10);
+  const verified = u.rows[0]?.verified || false;
+  const eligible = verified || (followerCount >= 100 && likeCount >= 100);
+  res.json({ eligible, followerCount, likeCount, verified, required: 100 });
 }));
 
 router.post('/videos/:id/like', requireAuth, safe(async (req, res) => {
@@ -95,6 +113,10 @@ router.post('/gifts', requireAuth, safe(async (req, res) => {
   if (!toUserId || !giftType || !coinCost || coinCost < 1) return res.status(400).json({ error: 'Invalid gift request' });
   if (toUserId === req.user.sub) return res.status(400).json({ error: "Can't gift yourself" });
 
+  const PLATFORM_CUT = 0.30; // VELTEX keeps 30%, same idea as TikTok's real gift economy
+  const recipientShare = Math.floor(coinCost * (1 - PLATFORM_CUT));
+  const platformShare = coinCost - recipientShare;
+
   const client = await pool.connect();
   try {
     await client.query('BEGIN');
@@ -104,13 +126,17 @@ router.post('/gifts', requireAuth, safe(async (req, res) => {
       return res.status(402).json({ error: 'Not enough coins' });
     }
     await client.query(`UPDATE users SET coins = coins - $1 WHERE id = $2`, [coinCost, req.user.sub]);
-    await client.query(`UPDATE users SET earnings_balance = earnings_balance + $1 WHERE id = $2`, [coinCost, toUserId]);
+    await client.query(`UPDATE users SET earnings_balance = earnings_balance + $1 WHERE id = $2`, [recipientShare, toUserId]);
     await client.query(
       `INSERT INTO gifts_sent (from_user_id, to_user_id, gift_type, coin_cost) VALUES ($1, $2, $3, $4)`,
       [req.user.sub, toUserId, giftType, coinCost]
     );
+    await client.query(
+      `INSERT INTO platform_revenue (source, amount) VALUES ('gift', $1)`,
+      [platformShare]
+    );
     await client.query('COMMIT');
-    res.status(201).json({ ok: true });
+    res.status(201).json({ ok: true, recipientShare, platformShare });
   } catch (err) {
     await client.query('ROLLBACK');
     throw err;
